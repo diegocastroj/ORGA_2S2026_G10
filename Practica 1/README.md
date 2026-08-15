@@ -16,6 +16,9 @@ Para el desarrollo de la práctica se implementan dos formas de visualización. 
 ## Simulación en Proteus
 <img src="assets/simulacion.gif" width="600">
 
+## Caracteres utilizados
+<img src="assets/abcdario.jpeg" width="600">
+
 ## Diagramas de Diseño
 ### Display Ánodo y Cátodo
 <img src="assets/segmentos.png" width="500">
