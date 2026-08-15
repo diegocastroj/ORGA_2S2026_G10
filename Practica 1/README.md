@@ -71,5 +71,10 @@ Para el desarrollo de la práctica se implementan dos formas de visualización. 
 
 
 ## Circuito Físico
-A continuación, se presentan las fotografías del circuito real ensamblado y funcionando:
+A continuación, se presentan las fotografías del circuito real.
 
+<img src="assets/armado1.jpeg" width="500">
+
+<img src="assets/armado2.jpg" width="500">
+
+<img src="assets/armado3.jpg" width="500">
