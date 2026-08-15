@@ -13,6 +13,9 @@ La presente práctica consiste en el diseño e implementación de un sistema de 
 
 Para el desarrollo de la práctica se implementan dos formas de visualización. La primera corresponde a la parte frontal, utilizando un display de 7 segmentos de cátodo común y funciones booleanas expresadas mediante términos mínimos. La segunda corresponde a la parte trasera, utilizando un display de ánodo común y considerando la representación en espejo, por lo que se emplean términos máximos y lógica activa en bajo. Estas características permiten que la información pueda visualizarse desde ambos lados del sistema.
 
+## Simulación en Proteus
+<img src="assets/simulacion.gif" width="600">
+
 ## Diagramas de Diseño
 ### Display Ánodo y Cátodo
 <img src="assets/segmentos.png" width="500">
@@ -78,3 +81,5 @@ A continuación, se presentan las fotografías del circuito real.
 <img src="assets/armado2.jpg" width="500">
 
 <img src="assets/armado3.jpg" width="500">
+
+<img src="assets/armado4.jpg" width="500">
