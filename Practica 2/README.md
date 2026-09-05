@@ -231,6 +231,10 @@ A continuación, se presentan las fotografías del circuito físico implementado
 
 <img src="assets/armado5.jpeg" width="500">
 
+### Fotografía 6
+
+<img src="assets/armado6.jpeg" width="500">
+
 
 ## Conclusiones
 
