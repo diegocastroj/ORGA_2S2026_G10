@@ -110,9 +110,3 @@ En esta sección se documenta el proceso de ensamblado físico, mostrando las pl
 
 
 ---
-
-## Estructura del Repositorio
-
-- **`/Simulacion`**: Contiene el archivo `.pdsprj` compatible con Proteus.
-- **`/Codigo`**: Contiene el archivo `.ino` cargado en el Arduino para la generación de pulsos de reloj y sincronización.
-- **`/Documentacion`**: Contiene el manual técnico en PDF con los diagramas, mapas de Karnaugh, funciones booleanas y conclusiones del proyecto.
