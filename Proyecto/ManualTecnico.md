@@ -444,7 +444,7 @@ El siguiente código conserva la estructura y la lógica del código proporciona
 
 ```cpp
 // ============================================================
-// PROYECTO: SMARTSORT GT (Version Actualizada)
+// PROYECTO: SMARTSORT GT 
 // PLATAFORMA: Arduino Mega 2560
 //
 // Descripcion:
