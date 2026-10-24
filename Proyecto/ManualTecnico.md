@@ -451,6 +451,7 @@ El siguiente código conserva la estructura y la lógica del código proporciona
 // Sistema de clasificacion de paquetes que utiliza dos sensores
 // opticos, dos servomotores, un motor para la banda, una pantalla
 // LCD, comunicacion Bluetooth y memoria EEPROM.
+// Adaptado para Arduino Mega utilizando puertos seriales por hardware.
 
 // ------------------------------------------------------------
 // BIBLIOTECAS
@@ -467,9 +468,6 @@ El siguiente código conserva la estructura y la lógica del código proporciona
 
 // Permite leer y escribir datos en la memoria EEPROM.
 #include <EEPROM.h>
-
-// Permite crear un puerto serial adicional mediante pines digitales.
-#include <SoftwareSerial.h>
 
 
 // ------------------------------------------------------------
@@ -506,11 +504,8 @@ Servo servoPequenos;
 
 // Pantalla LCD I2C de 16 columnas por 2 filas.
 // La direccion 0x27 debe coincidir con la de la pantalla instalada.
+// Conectada a los pines 20 (SDA) y 21 (SCL) del Arduino Mega.
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-
-// Puerto serial para el modulo Bluetooth HC-06.
-// El primer argumento es RX del Arduino y el segundo es TX.
-SoftwareSerial bt(2, 3);
 
 
 // ------------------------------------------------------------
@@ -571,8 +566,9 @@ void setup() {
   // Inicializa la comunicacion serial para depuracion por USB.
   Serial.begin(9600);
 
-  // Inicializa la comunicacion con el modulo Bluetooth.
-  bt.begin(9600);
+  // Inicializa la comunicacion con el modulo Bluetooth utilizando el puerto
+  // de hardware Serial1 nativo del Arduino Mega (Pines 18 TX1 y 19 RX1).
+  Serial1.begin(9600);
 
 
   // Configura como salidas los dispositivos que reciben senales
@@ -639,18 +635,18 @@ void loop() {
 // FUNCION procesarBluetooth()
 // ============================================================
 // Lee comandos enviados desde la aplicacion movil y ejecuta
-// la accion correspondiente.
+// la accion correspondiente a traves de Serial1 (Mega).
 // ============================================================
 
 void procesarBluetooth() {
 
-  // Comprueba si hay datos disponibles en el puerto Bluetooth.
-  if (bt.available() > 0) {
+  // Comprueba si hay datos disponibles en el puerto Bluetooth (hardware).
+  if (Serial1.available() > 0) {
 
     // Lee el texto hasta encontrar un salto de linea.
     // Esta lectura puede esperar hasta recibir el delimitador
     // o hasta que venza el tiempo de espera serial.
-    String cmd = bt.readStringUntil('\n');
+    String cmd = Serial1.readStringUntil('\n');
 
     // Elimina espacios y saltos de linea al inicio y al final.
     cmd.trim();
