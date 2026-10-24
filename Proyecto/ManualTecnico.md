@@ -444,18 +444,22 @@ El siguiente código conserva la estructura y la lógica del código proporciona
 
 ```cpp
 // ============================================================
-// PROYECTO: SMARTSORT GT
-// CURSO: ORGANIZACION COMPUTACIONAL
+// PROYECTO: SMARTSORT GT (Version Actualizada)
+// PLATAFORMA: Arduino Mega 2560
 //
 // Descripcion:
-// Sistema de clasificacion de paquetes que utiliza dos sensores
-// opticos, dos servomotores, un motor para la banda, una pantalla
-// LCD, comunicacion Bluetooth y memoria EEPROM.
-// Adaptado para Arduino Mega utilizando puertos seriales por hardware.
+// Sistema de clasificacion de paquetes no bloqueante.
+// Utiliza maquina de estados para los sensores y control de
+// tiempo con millis() para permitir recepcion Bluetooth continua
+// y manejo simultaneo de actuadores. Incorpora control de rele.
+// ============================================================
 
 // ------------------------------------------------------------
 // BIBLIOTECAS
 // ------------------------------------------------------------
+
+// Permite controlar los servomotores.
+#include <Servo.h>
 
 // Permite utilizar la comunicacion I2C de la pantalla LCD.
 #include <Wire.h>
@@ -463,676 +467,493 @@ El siguiente código conserva la estructura y la lógica del código proporciona
 // Permite controlar una pantalla LCD mediante un adaptador I2C.
 #include <LiquidCrystal_I2C.h>
 
-// Permite controlar los servomotores.
-#include <Servo.h>
-
 // Permite leer y escribir datos en la memoria EEPROM.
 #include <EEPROM.h>
 
 
 // ------------------------------------------------------------
-// CONFIGURACION DE PINES
+// CONFIGURACION DE PINES (Arduino Mega 2560)
 // ------------------------------------------------------------
 
-// Entradas analogicas de los sensores LDR.
-// Cada sensor recibe la luz del laser correspondiente.
-const int pinLDR1 = A0; // Sensor inferior
-const int pinLDR2 = A1; // Sensor superior
+// Pin para el control del rele que enciende/apaga la banda.
+const int pinRelayMotor = 7;
 
-// Salida de control para el circuito que activa la banda.
-// El motor debe utilizar un circuito de potencia apropiado.
-const int pinMotor = 7;
+// Entradas analogicas para los sensores de luz (LDR).
+const int pinLDRBajo = A0;  // L1 (Sensor Inferior)
+const int pinLDRAlto = A1;  // L2 (Sensor Superior)
 
-// Salida para generar las alertas sonoras.
-const int pinBuzzer = 8;
+// Pines PWM para el control de los servomotores.
+const int pinServo1 = 8;
+const int pinServo2 = 9;
 
-// Indicadores visuales del estado del sistema.
-const int pinLedAzul = 4;
-const int pinLedVerde = 5;
-const int pinLedRojo = 6;
+// Indicadores visuales y sonoro del estado del sistema.
+const int pinLedAzul = 2;
+const int pinLedVerde = 3;
+const int pinLedRojo = 4;
+const int pinBuzzer = 5;
+
+// Valor umbral para detectar si el haz de luz de los laseres fue interrumpido.
+const int UMBRAL_LDR = 700;
+
+
+// ------------------------------------------------------------
+// DIRECCIONES DE MEMORIA EEPROM
+// ------------------------------------------------------------
+// Espacios asignados para guardar de forma permanente los contadores.
+const int DIR_GRANDE = 0;           // Ocupa 2 bytes (int)
+const int DIR_PEQUENO = 2;          // Ocupa 2 bytes (int)
+const int DIR_RECHAZO = 4;          // Ocupa 2 bytes (int)
+const int DIR_TOTAL_HISTORICO = 8;  // Ocupa 4 bytes (unsigned long)
 
 
 // ------------------------------------------------------------
 // OBJETOS PARA LOS PERIFERICOS
 // ------------------------------------------------------------
 
-// Servomotor encargado del desvio de paquetes grandes.
-Servo servoGrandes;
-
-// Servomotor encargado del desvio de paquetes pequenos.
-Servo servoPequenos;
-
-// Pantalla LCD I2C de 16 columnas por 2 filas.
-// La direccion 0x27 debe coincidir con la de la pantalla instalada.
-// Conectada a los pines 20 (SDA) y 21 (SCL) del Arduino Mega.
+Servo servo1;
+Servo servo2;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 
 // ------------------------------------------------------------
-// CONTADORES DE PRODUCCION
+// VARIABLES PARA TEMPORIZACION DE SERVOS
 // ------------------------------------------------------------
 
-// Variables que almacenan las cantidades de paquetes procesados.
-// Sus valores se guardan en EEPROM para conservarlos al reiniciar.
-int pGrandes = 0;
-int pPequenos = 0;
-int pRechazos = 0;
+unsigned long tiempoActivacionS1 = 0;
+unsigned long tiempoActivacionS2 = 0;
+bool s1Activo = false;
+bool s2Activo = false;
 
-// Acumulado de todos los paquetes procesados.
-// Se conserva cuando se reinician los contadores del turno.
-long totalHistorico = 0;
-
-
-// ------------------------------------------------------------
-// VARIABLES DE ESTADO Y MODOS
-// ------------------------------------------------------------
-
-// Modo de funcionamiento utilizado por el programa.
-String modoActual = "NORMAL";
-
-// Indica si la banda esta habilitada.
-bool bandaActiva = false;
-
-// Cantidad de paquetes que debe procesar el modo por lote.
-int loteObjetivo = 0;
-
-// Cantidad de paquetes registrados en el lote actual.
-int loteActual = 0;
+// Tiempos que los servos se mantienen en posicion de desvio.
+const unsigned long TIEMPO_RETORNO_S1 = 4500; 
+const unsigned long TIEMPO_RETORNO_S2 = 7500; 
 
 
 // ------------------------------------------------------------
-// VARIABLES PARA TEMPORIZACION
+// VARIABLES DE SENSORES Y MAQUINA DE ESTADOS
 // ------------------------------------------------------------
 
-// Guarda el instante en que comienza la secuencia del servo.
-unsigned long tiempoServo = 0;
+// Estados posibles para la deteccion de un paquete.
+enum EstadoDeteccion { ESPERANDO, CONFIRMANDO, ESPERANDO_LIBERACION };
+EstadoDeteccion estadoSensor = ESPERANDO;
 
-// Indica si hay una secuencia de actuacion en curso.
-bool servoActivo = false;
+unsigned long tiempoInicioDeteccion = 0;
+const unsigned long TIEMPO_CONFIRMACION = 150; // Ventana para evitar falsos positivos
 
-// Guarda el instante de referencia para apagar los LED.
-unsigned long tiempoLed = 0;
+bool l1Detectado = false;
+bool l2Detectado = false;
+unsigned long tiempoRechazo = 0;
+bool rechazoActivo = false;
+
+
+// ------------------------------------------------------------
+// VARIABLES PARA BUZZER (MODO NO BLOQUEANTE)
+// ------------------------------------------------------------
+
+bool beepRechazoActivo = false;
+int beepsRealizados = 0;
+unsigned long tiempoUltimoBeep = 0;
+
+
+// ------------------------------------------------------------
+// VARIABLES DE BLUETOOTH Y ESTADO DEL SISTEMA
+// ------------------------------------------------------------
+
+// Almacena los caracteres recibidos por Bluetooth hasta armar el comando.
+String comandoBT = "";
+
+// Estados generales de operacion de la maquina.
+enum ModoOperacion { DETENIDO, NORMAL, PAUSADO, MANTENIMIENTO, LOTE, FIN_LOTE };
+ModoOperacion modoActual = DETENIDO;
+
+// Estadisticas de produccion.
+int contGrande = 0;
+int contPequeno = 0;
+int contRechazo = 0;
+unsigned long totalHistorico = 0; 
+int objetivoLote = 0;
+int procesadosLote = 0;
 
 
 // ============================================================
 // FUNCION setup()
 // ============================================================
-// Se ejecuta una sola vez al encender o reiniciar el Arduino.
-// Inicializa los componentes antes de comenzar la operacion.
+// Se ejecuta al encender el sistema. Inicializa hardware,
+// configura la EEPROM y establece estados iniciales.
 // ============================================================
 
 void setup() {
 
-  // Inicializa la comunicacion serial para depuracion por USB.
-  Serial.begin(9600);
+  // Inicializa la consola serie para diagnostico por USB.
+  Serial.begin(9600);   
 
-  // Inicializa la comunicacion con el modulo Bluetooth utilizando el puerto
-  // de hardware Serial1 nativo del Arduino Mega (Pines 18 TX1 y 19 RX1).
-  Serial1.begin(9600);
-
-
-  // Configura como salidas los dispositivos que reciben senales
-  // de control desde el Arduino.
-  pinMode(pinMotor, OUTPUT);
-  pinMode(pinBuzzer, OUTPUT);
+  // Inicializa la comunicacion con el modulo HC-06 usando el 
+  // puerto serial por hardware del Mega (Pines 18 TX1 y 19 RX1).
+  Serial1.begin(9600);  
+  
+  // Configuracion de pines de salida.
+  pinMode(pinRelayMotor, OUTPUT);
   pinMode(pinLedAzul, OUTPUT);
   pinMode(pinLedVerde, OUTPUT);
   pinMode(pinLedRojo, OUTPUT);
+  pinMode(pinBuzzer, OUTPUT);
 
+  // Vincula los servos a sus respectivos pines.
+  servo1.attach(pinServo1);
+  servo2.attach(pinServo2);
 
-  // Asocia cada objeto Servo con su pin de control.
-  servoGrandes.attach(9);
-  servoPequenos.attach(10);
+  // Posicion neutral inicial.
+  servo1.write(90); 
+  servo2.write(90);
 
-  // Coloca ambos servos en su posicion neutral inicial.
-  resetServos();
-
-
-  // Inicializa la pantalla y activa su iluminacion.
+  // Inicializa la pantalla LCD y enciende la luz de fondo.
   lcd.init();
   lcd.backlight();
+  
+  // Recupera los valores estadisticos guardados en la EEPROM.
+  EEPROM.get(DIR_GRANDE, contGrande);
+  EEPROM.get(DIR_PEQUENO, contPequeno);
+  EEPROM.get(DIR_RECHAZO, contRechazo);
+  EEPROM.get(DIR_TOTAL_HISTORICO, totalHistorico);
 
-
-  // Recupera los contadores previamente guardados.
-  cargarEEPROM();
-
-
-  // Enciende el LED azul para indicar que el sistema inicio.
+  // Validacion de seguridad para evitar datos corruptos
+  // o basura si la EEPROM es nueva.
+  if (contGrande < 0 || contGrande > 32000) contGrande = 0;
+  if (contPequeno < 0 || contPequeno > 32000) contPequeno = 0;
+  if (contRechazo < 0 || contRechazo > 32000) contRechazo = 0;
+  if (totalHistorico == 0xFFFFFFFF) totalHistorico = 0; 
+  
+  // Mensaje de bienvenida en pantalla.
+  actualizarLCD("SmartSort GT", "Esperando cmd...");
+  
+  // Enciende LED azul de forma constante indicando sistema listo.
   digitalWrite(pinLedAzul, HIGH);
 
-  // Muestra un mensaje inicial en la pantalla.
-  actualizarLCD("SmartSort GT", "Esperando cmd..");
+  // Apaga el rele. (Logica negativa: HIGH significa apagado).
+  digitalWrite(pinRelayMotor, HIGH); 
 }
 
 
 // ============================================================
 // FUNCION loop()
 // ============================================================
-// Se repite continuamente mientras el Arduino esta encendido.
-// Coordina la recepcion de comandos, la lectura de sensores
-// y las tareas que dependen del tiempo.
+// Bucle principal. Escanea Bluetooth, lee sensores, evalua 
+// la maquina de estados y maneja tiempos de forma no bloqueante.
 // ============================================================
 
 void loop() {
 
-  // Comprueba si se recibio una instruccion por Bluetooth.
-  procesarBluetooth();
+  // Captura el tiempo actual en milisegundos para usar como
+  // referencia en todos los temporizadores.
+  unsigned long tiempoActual = millis();
 
 
-  // Lee los sensores solamente cuando la banda esta activa
-  // y el modo actual no es el de mantenimiento.
-  if (bandaActiva && modoActual != "MANTENIM") {
-    leerSensores();
-  }
+  // ----------------------------------------------------------
+  // 1. PROCESAMIENTO BLUETOOTH NO BLOQUEANTE
+  // ----------------------------------------------------------
+  // Lee el bufer caracter por caracter sin usar delay ni readString.
+  while (Serial1.available() > 0) {
+    char c = Serial1.read();
 
-
-  // Revisa si corresponde finalizar una actuacion o apagar LED.
-  gestionarTemporizadores();
-}
-
-
-// ============================================================
-// FUNCION procesarBluetooth()
-// ============================================================
-// Lee comandos enviados desde la aplicacion movil y ejecuta
-// la accion correspondiente a traves de Serial1 (Mega).
-// ============================================================
-
-void procesarBluetooth() {
-
-  // Comprueba si hay datos disponibles en el puerto Bluetooth (hardware).
-  if (Serial1.available() > 0) {
-
-    // Lee el texto hasta encontrar un salto de linea.
-    // Esta lectura puede esperar hasta recibir el delimitador
-    // o hasta que venza el tiempo de espera serial.
-    String cmd = Serial1.readStringUntil('\n');
-
-    // Elimina espacios y saltos de linea al inicio y al final.
-    cmd.trim();
-
-
-    // --------------------------------------------------------
-    // COMANDO: iniciar
-    // Activa la banda y establece el modo normal.
-    // --------------------------------------------------------
-    if (cmd == "iniciar") {
-
-      bandaActiva = true;
-      digitalWrite(pinMotor, HIGH);
-
-      modoActual = "NORMAL";
-
-      actualizarLCD("Modo: NORMAL", "Banda: ON");
-
-
-    // --------------------------------------------------------
-    // COMANDO: pausa
-    // Desactiva la banda temporalmente.
-    // --------------------------------------------------------
-    } else if (cmd == "pausa") {
-
-      bandaActiva = false;
-      digitalWrite(pinMotor, LOW);
-
-      actualizarLCD("PAUSADO", "Banda: OFF");
-
-
-    // --------------------------------------------------------
-    // COMANDO: detener
-    // Detiene la banda y muestra las estadisticas actuales.
-    // --------------------------------------------------------
-    } else if (cmd == "detener") {
-
-      bandaActiva = false;
-      digitalWrite(pinMotor, LOW);
-
-      mostrarReporte();
-
-
-    // --------------------------------------------------------
-    // COMANDO: reporte
-    // Presenta las estadisticas disponibles en la LCD.
-    // --------------------------------------------------------
-    } else if (cmd == "reporte") {
-
-      mostrarReporte();
-
-
-    // --------------------------------------------------------
-    // COMANDO: Resetear
-    // Reinicia los contadores del turno.
-    // El total historico se conserva.
-    // --------------------------------------------------------
-    } else if (cmd == "Resetear") {
-
-      pGrandes = 0;
-      pPequenos = 0;
-      pRechazos = 0;
-
-      // Guarda los contadores reiniciados en EEPROM.
-      guardarEEPROM();
-
-      actualizarLCD("Reset OK", "Nuevo turno listo");
-
-
-    // --------------------------------------------------------
-    // COMANDO: modo_lote:N
-    // Configura un lote de N paquetes y activa la banda.
-    // --------------------------------------------------------
-    } else if (cmd.startsWith("modo_lote:")) {
-
-      // Extrae el texto situado despues de "modo_lote:".
-      // toInt() convierte el texto a un numero entero.
-      loteObjetivo = cmd.substring(10).toInt();
-
-      // Reinicia el contador de paquetes del lote.
-      loteActual = 0;
-
-      // Activa el modo por lote.
-      modoActual = "LOTE";
-
-      bandaActiva = true;
-      digitalWrite(pinMotor, HIGH);
-
-      actualizarLCD(
-        "Lote: " + String(loteObjetivo) + " paq",
-        "Banda: ON"
-      );
-
-
-    // --------------------------------------------------------
-    // COMANDO: modo_normal
-    // Establece el modo normal de funcionamiento.
-    // --------------------------------------------------------
-    } else if (cmd == "modo_normal") {
-
-      modoActual = "NORMAL";
-
-      actualizarLCD("Modo: NORMAL", "Esperando...");
-
-
-    // --------------------------------------------------------
-    // COMANDO: modo_mantenimiento
-    // Activa la banda y evita la lectura normal de sensores.
-    // --------------------------------------------------------
-    } else if (cmd == "modo_mantenimiento") {
-
-      modoActual = "MANTENIM";
-
-      bandaActiva = true;
-      digitalWrite(pinMotor, HIGH);
-
-      actualizarLCD("Modo: MANTENIM.", "Banda: ON");
-
-
-    // --------------------------------------------------------
-    // COMANDO: estado
-    // Muestra el modo actual y el estado de la banda.
-    // --------------------------------------------------------
-    } else if (cmd == "estado") {
-
-      actualizarLCD(
-        "Modo: " + modoActual,
-        bandaActiva ? "Banda: ON" : "Banda: OFF"
-      );
-
-
-    // --------------------------------------------------------
-    // COMANDO NO RECONOCIDO
-    // Informa que el texto recibido no coincide con los comandos.
-    // --------------------------------------------------------
+    // Si se detecta un salto de linea, finalizo el comando.
+    if (c == '\n' || c == '\r') {
+      if (comandoBT.length() > 0) {
+        ejecutarComando(comandoBT);
+        comandoBT = ""; // Limpia el buffer para el siguiente comando
+      }
     } else {
-
-      actualizarLCD("ERROR:", "Cmd invalido");
+      // Concatena caracteres al comando.
+      comandoBT += c;
     }
   }
-}
-
-
-// ============================================================
-// FUNCION leerSensores()
-// ============================================================
-// Lee las entradas analogicas y determina la categoria del
-// objeto segun el umbral definido.
-// ============================================================
-
-void leerSensores() {
-
-  // Evita iniciar otra clasificacion mientras la secuencia
-  // anterior del servo sigue activa.
-  if (servoActivo) return;
-
-
-  // Obtiene los valores analogicos de ambos sensores.
-  // Normalmente analogRead() devuelve un valor entre 0 y 1023
-  // en las placas AVR habituales.
-  int luz1 = analogRead(pinLDR1);
-  int luz2 = analogRead(pinLDR2);
-
-
-  // Umbral de deteccion inicial.
-  // Debe calibrarse con los valores medidos en el montaje real.
-  int umbral = 800;
-
-
-  // Si la lectura esta por debajo del umbral, se interpreta
-  // que el haz de luz fue interrumpido.
-  bool l1_corte = (luz1 < umbral);
-  bool l2_corte = (luz2 < umbral);
 
 
   // ----------------------------------------------------------
-  // LOGICA DE CLASIFICACION
+  // 2. LECTURA DE SENSORES Y CLASIFICACION (Maquina de Estados)
   // ----------------------------------------------------------
-  // 1. Si no se interrumpe ningun haz, no se procesa un paquete.
-  // 2. Si solo se interrumpe el sensor inferior, se clasifica
-  //    como pequeno.
-  // 3. Si se interrumpen ambos sensores, se clasifica como grande.
-  // 4. Si solo se interrumpe el sensor superior, se clasifica
-  //    como rechazo.
-  //
-  // Esta tabla debe comprobarse con la ubicacion fisica real
-  // de los sensores y el tamano de los paquetes.
-  // ----------------------------------------------------------
+  if (modoActual == NORMAL || modoActual == LOTE) {
 
-  if (l1_corte || l2_corte) {
+    // Lee los sensores analogicos LDR.
+    int valorL1 = analogRead(pinLDRBajo);
+    int valorL2 = analogRead(pinLDRAlto);
 
-    if (l1_corte && !l2_corte) {
+    // Evalua si el laser se interrumpio (lectura baja).
+    bool actualL1 = (valorL1 < UMBRAL_LDR);
+    bool actualL2 = (valorL2 < UMBRAL_LDR);
 
-      clasificarPaquete(1); // Pequeno
+    // ESTADO 1: Esperando la llegada de un objeto.
+    if (estadoSensor == ESPERANDO) {
+      if (actualL1 || actualL2) {
+        estadoSensor = CONFIRMANDO;
+        tiempoInicioDeteccion = tiempoActual;
+        l1Detectado = actualL1;
+        l2Detectado = actualL2;
+      }
+    } 
+    // ESTADO 2: Confirmando deteccion (evita lecturas falsas).
+    else if (estadoSensor == CONFIRMANDO) {
 
-    } else if (l1_corte && l2_corte) {
+      // Acumula la deteccion si algun sensor se corta en esta ventana de tiempo.
+      if (actualL1) l1Detectado = true;
+      if (actualL2) l2Detectado = true;
 
-      clasificarPaquete(2); // Grande
+      // Si termino la ventana de confirmacion, decide el tipo.
+      if (tiempoActual - tiempoInicioDeteccion >= TIEMPO_CONFIRMACION) {
+        int tipo = 0;
+        
+        // Logica de tamaños
+        if (l1Detectado && l2Detectado) tipo = 1;      // Ambos sensores: GRANDE
+        else if (l1Detectado && !l2Detectado) tipo = 2; // Solo abajo: PEQUENO
+        else if (!l1Detectado && l2Detectado) tipo = 3; // Solo arriba: RECHAZO (Anomalo)
 
-    } else {
 
-      clasificarPaquete(3); // Rechazo
+        // ACCION: PAQUETE GRANDE
+        if (tipo == 1 && !s1Activo) { 
+          servo1.write(45);
+          digitalWrite(pinLedVerde, HIGH);
+          tone(pinBuzzer, 1000, 200); // 1 beep corto
+          actualizarLCD("Paq: GRANDE", "Desviando S1");
+          
+          s1Activo = true;
+          tiempoActivacionS1 = tiempoActual;
+          
+          if (contGrande < 32000) contGrande++;
+          if (totalHistorico < 4000000000) totalHistorico++; 
+          
+          EEPROM.put(DIR_GRANDE, contGrande);
+          EEPROM.put(DIR_TOTAL_HISTORICO, totalHistorico);
+          procesadosLote++;
+        } 
+        
+        // ACCION: PAQUETE PEQUENO
+        else if (tipo == 2 && !s2Activo) { 
+          servo2.write(140);
+          digitalWrite(pinLedVerde, HIGH);
+          tone(pinBuzzer, 1500, 200); // 1 beep corto
+          actualizarLCD("Paq: PEQUENO", "Desviando S2");
+          
+          s2Activo = true;
+          tiempoActivacionS2 = tiempoActual;
+          
+          if (contPequeno < 32000) contPequeno++;
+          if (totalHistorico < 4000000000) totalHistorico++;
+          
+          EEPROM.put(DIR_PEQUENO, contPequeno);
+          EEPROM.put(DIR_TOTAL_HISTORICO, totalHistorico);
+          procesadosLote++;
+        }
+        
+        // ACCION: PAQUETE RECHAZADO
+        else if (tipo == 3) {
+          digitalWrite(pinLedRojo, HIGH);
+          actualizarLCD("Paq: RECHAZO", "Sin desvio");
+          
+          rechazoActivo = true;
+          tiempoRechazo = tiempoActual;
+          
+          if (contRechazo < 32000) contRechazo++;
+          if (totalHistorico < 4000000000) totalHistorico++;
+          
+          EEPROM.put(DIR_RECHAZO, contRechazo);
+          EEPROM.put(DIR_TOTAL_HISTORICO, totalHistorico);
+          procesadosLote++;
+          
+          // Iniciar secuencia de 3 beeps rapidos de forma no bloqueante.
+          beepRechazoActivo = true;
+          beepsRealizados = 1;
+          tiempoUltimoBeep = tiempoActual;
+          tone(pinBuzzer, 500, 100);
+        }
+
+        // Evalua si se completo la meta en modo por Lotes.
+        if (modoActual == LOTE && procesadosLote >= objetivoLote) {
+           modoActual = FIN_LOTE; // Cambio de estado a espera de servos
+           actualizarLCD("Meta alcanzada", "Terminando...");
+        }
+
+        // Pasa al estado de esperar que el objeto se vaya del sensor.
+        estadoSensor = ESPERANDO_LIBERACION;
+      }
+    } 
+    // ESTADO 3: Espera a que los laseres vuelvan a verse (objeto salio).
+    else if (estadoSensor == ESPERANDO_LIBERACION) {
+      if (!actualL1 && !actualL2) {
+        estadoSensor = ESPERANDO; // Reinicia la maquina de estados.
+      }
     }
   }
-}
-
-
-// ============================================================
-// FUNCION clasificarPaquete()
-// ============================================================
-// Registra la categoria identificada y activa los dispositivos
-// correspondientes.
-// tipo = 1: paquete pequeno
-// tipo = 2: paquete grande
-// tipo = 3: rechazo
-// ============================================================
-
-void clasificarPaquete(int tipo) {
-
-  // Marca el inicio de una secuencia de actuacion.
-  servoActivo = true;
-
-  // Guarda el instante inicial para medir el tiempo de actuacion.
-  tiempoServo = millis();
-
-  // Guarda el instante de referencia para los indicadores.
-  tiempoLed = millis();
 
 
   // ----------------------------------------------------------
-  // PAQUETE PEQUENO
+  // 3. SECUENCIADOR DE BEEPS PARA RECHAZO (No bloqueante)
   // ----------------------------------------------------------
-  if (tipo == 1) {
-
-    // Incrementa el contador de paquetes pequenos.
-    pPequenos++;
-
-    // Ordena el movimiento del servo para pequenos.
-    servoPequenos.write(45);
-
-    // Enciende el LED de clasificacion correcta.
-    digitalWrite(pinLedVerde, HIGH);
-
-    // Emite una senal sonora breve.
-    tone(pinBuzzer, 1500, 200);
-
-    // Informa al operador sobre la clasificacion.
-    actualizarLCD("Paq: PEQUENO", "Desviando S2");
-
-
-  // ----------------------------------------------------------
-  // PAQUETE GRANDE
-  // ----------------------------------------------------------
-  } else if (tipo == 2) {
-
-    // Incrementa el contador de paquetes grandes.
-    pGrandes++;
-
-    // Ordena el movimiento del servo para grandes.
-    servoGrandes.write(45);
-
-    // Enciende el LED de clasificacion correcta.
-    digitalWrite(pinLedVerde, HIGH);
-
-    // Emite una senal sonora de frecuencia diferente.
-    tone(pinBuzzer, 1000, 200);
-
-    // Informa al operador sobre la clasificacion.
-    actualizarLCD("Paq: GRANDE", "Desviando S1");
-
-
-  // ----------------------------------------------------------
-  // PAQUETE RECHAZADO
-  // ----------------------------------------------------------
-  } else {
-
-    // Incrementa el contador de paquetes rechazados.
-    pRechazos++;
-
-    // Enciende el LED rojo para indicar el rechazo.
-    digitalWrite(pinLedRojo, HIGH);
-
-    // Emite una senal sonora breve.
-    // El codigo actual genera una sola llamada a tone()
-    // para este evento; no implementa tres beeps separados.
-    tone(pinBuzzer, 500, 100);
-
-    // Informa que el paquete se dejara pasar sin desvio activo.
-    actualizarLCD("Paq: RECHAZO", "Pasa libre");
-  }
-
-
-  // ----------------------------------------------------------
-  // ACTUALIZACION DE ESTADISTICAS
-  // ----------------------------------------------------------
-
-  // Incrementa el acumulado historico de paquetes procesados.
-  totalHistorico++;
-
-  // Guarda los contadores actualizados en EEPROM.
-  guardarEEPROM();
-
-
-  // ----------------------------------------------------------
-  // CONTROL DEL MODO POR LOTE
-  // ----------------------------------------------------------
-
-  if (modoActual == "LOTE") {
-
-    // Registra un paquete procesado en el lote.
-    loteActual++;
-
-    // Comprueba si se alcanzo la cantidad solicitada.
-    if (loteActual >= loteObjetivo) {
-
-      // Detiene la banda al finalizar el lote.
-      bandaActiva = false;
-      digitalWrite(pinMotor, LOW);
-
-      // Muestra el resultado del lote.
-      actualizarLCD(
-        "Lote completo",
-        "Procesados: " + String(loteActual)
-      );
-
-      // Emite una senal sonora prolongada.
-      tone(pinBuzzer, 800, 1000);
-
-      // Cambia el modo actual a NORMAL.
-      modoActual = "NORMAL";
+  // Genera multiples tonos seguidos usando la diferencia de tiempo.
+  if (beepRechazoActivo) {
+    if (tiempoActual - tiempoUltimoBeep >= 200) { 
+      if (beepsRealizados < 3) { 
+        tone(pinBuzzer, 500, 100);
+        tiempoUltimoBeep = tiempoActual;
+        beepsRealizados++;
+      } else {
+        beepRechazoActivo = false; // Finaliza la secuencia.
+      }
     }
   }
-}
 
 
-// ============================================================
-// FUNCION gestionarTemporizadores()
-// ============================================================
-// Comprueba los tiempos transcurridos desde la activacion de
-// los servomotores y los indicadores luminosos.
-// ============================================================
-
-void gestionarTemporizadores() {
-
-  // Si hay una actuacion activa y han transcurrido dos segundos,
-  // devuelve los servomotores a su posicion neutral.
-  if (servoActivo && (millis() - tiempoServo >= 2000)) {
-
-    resetServos();
-
-    // Permite volver a leer los sensores.
-    servoActivo = false;
+  // ----------------------------------------------------------
+  // 4. CIERRE DE LOTE DEMORADO
+  // ----------------------------------------------------------
+  // Apaga la banda solo cuando ningun actuador sigue moviendose.
+  if (modoActual == FIN_LOTE) {
+    if (!s1Activo && !s2Activo && !rechazoActivo) {
+      modoActual = DETENIDO;
+      
+      digitalWrite(pinRelayMotor, HIGH); // Apagar banda (Logica negativa)
+      
+      actualizarLCD("Lote completo", "Banda: OFF");
+      tone(pinBuzzer, 2000, 1500); // Tono largo de aviso final
+    }
   }
 
 
-  // Apaga los LED verde y rojo despues del intervalo definido.
-  // El tiempo se mide desde la referencia guardada en tiempoLed.
-  if (millis() - tiempoLed > 500) {
-
+  // ----------------------------------------------------------
+  // 5. GESTION DE RETORNO DE SERVOS Y APAGADO DE LEDS
+  // ----------------------------------------------------------
+  
+  // Revisa si el tiempo del Servo 1 ya caduco.
+  if (s1Activo && (tiempoActual - tiempoActivacionS1 >= TIEMPO_RETORNO_S1)) {
+    servo1.write(90);
     digitalWrite(pinLedVerde, LOW);
+    s1Activo = false;
+    refrescarPantallaBase();
+  }
+
+  // Revisa si el tiempo del Servo 2 ya caduco.
+  if (s2Activo && (tiempoActual - tiempoActivacionS2 >= TIEMPO_RETORNO_S2)) {
+    servo2.write(90);
+    digitalWrite(pinLedVerde, LOW);
+    s2Activo = false;
+    refrescarPantallaBase();
+  }
+
+  // Revisa si el indicador de rechazo ya debe apagarse.
+  if (rechazoActivo && (tiempoActual - tiempoRechazo >= 1500)) {
     digitalWrite(pinLedRojo, LOW);
+    rechazoActivo = false;
+    refrescarPantallaBase();
   }
 }
 
 
 // ============================================================
-// FUNCION resetServos()
+// FUNCION ejecutarComando()
 // ============================================================
-// Coloca ambos servomotores en la posicion neutral configurada.
-// El angulo de 90 grados debe verificarse mecanicamente.
+// Identifica el texto recibido y ejecuta la accion correspondiente.
 // ============================================================
 
-void resetServos() {
+void ejecutarComando(String cmd) {
+  
+  // Elimina espacios en blanco y saltos de linea accidentales.
+  cmd.trim(); 
+  
+  if (cmd.equalsIgnoreCase("iniciar") || cmd.equalsIgnoreCase("modo_normal")) {
+    modoActual = NORMAL;
+    digitalWrite(pinRelayMotor, LOW); // Encender banda (logica negativa)
+    actualizarLCD("Modo: NORMAL", "Banda: ON");
+  } 
+  else if (cmd.equalsIgnoreCase("pausa")) {
+    modoActual = PAUSADO;
+    digitalWrite(pinRelayMotor, HIGH); // Apagar banda
+    actualizarLCD("PAUSADO", "Banda: OFF");
+  } 
+  else if (cmd.equalsIgnoreCase("detener")) {
+    modoActual = DETENIDO;
+    digitalWrite(pinRelayMotor, HIGH); // Apagar banda
+    
+    // Muestra estadisticas del turno
+    String rep = "G:" + String(contGrande) + " P:" + String(contPequeno) + " R:" + String(contRechazo)  + " T:" + String(contGrande+contPequeno+contRechazo);
+    actualizarLCD("REPORTE FINAL", rep);
+  } 
+  else if (cmd.equalsIgnoreCase("modo_mantenimiento")) {
+    modoActual = MANTENIMIENTO;
+    digitalWrite(pinRelayMotor, LOW); // Banda encendida pero no lee sensores
+    actualizarLCD("Modo: MANTENIM.", "Sensores OFF");
+  }
+  else if (cmd.equalsIgnoreCase("estado")) {
+    refrescarPantallaBase();
+  }
+  else if (cmd.equalsIgnoreCase("reporte")) {
+    // Formatea los contadores en ambas lineas
+    String linea1 = "G:" + String(contGrande) + " P:" + String(contPequeno);
+    String linea2 = "R:" + String(contRechazo) + " T:" + String(contGrande+contPequeno+contRechazo) + "   H:" + String(totalHistorico); 
+    actualizarLCD(linea1, linea2);
+  }
+  else if (cmd.startsWith("modo_lote:")) {
+    // Extrae el numero deseado del comando de lote
+    String strNum = cmd.substring(10);
+    objetivoLote = strNum.toInt();
+    
+    if (objetivoLote > 0) {
+      modoActual = LOTE;
+      procesadosLote = 0; 
+      digitalWrite(pinRelayMotor, LOW); // Encender banda
+      actualizarLCD("Lote: " + String(objetivoLote) + " paq", "Banda: ON");
+    } else {
+      actualizarLCD("ERROR:", "Param. invalido");
+    }
+  }
+  else if (cmd.equalsIgnoreCase("resetear")) {
+    // Pone en cero los contadores de turno (Historico se mantiene intacto)
+    contGrande = 0;
+    contPequeno = 0;
+    contRechazo = 0;
+    
+    // Aplica el reseteo a la memoria permanente
+    EEPROM.put(DIR_GRANDE, contGrande);
+    EEPROM.put(DIR_PEQUENO, contPequeno);
+    EEPROM.put(DIR_RECHAZO, contRechazo);
+    
+    actualizarLCD("Reset OK", "Nuevo turno listo");
+  }
+  else {
+    // Manejo de comandos desconocidos
+    actualizarLCD("ERROR:", "Cmd invalido");
+  }
+}
 
-  servoGrandes.write(90);
-  servoPequenos.write(90);
+
+// ============================================================
+// FUNCION refrescarPantallaBase()
+// ============================================================
+// Reestablece el texto de la pantalla LCD segun el modo actual
+// despues de mostrar mensajes temporales (como "Desviando...").
+// ============================================================
+
+void refrescarPantallaBase() {
+  if (modoActual == NORMAL) actualizarLCD("Modo: NORMAL", "Banda: ON");
+  else if (modoActual == PAUSADO) actualizarLCD("PAUSADO", "Banda: OFF");
+  else if (modoActual == DETENIDO) actualizarLCD("SmartSort GT", "Esperando cmd...");
+  else if (modoActual == MANTENIMIENTO) actualizarLCD("Modo: MANTENIM.", "Sensores OFF");
+  else if (modoActual == LOTE) actualizarLCD("Lote: " + String(objetivoLote) + " paq", "Procesando...");
 }
 
 
 // ============================================================
 // FUNCION actualizarLCD()
 // ============================================================
-// Limpia la pantalla y escribe los mensajes recibidos.
-// l1 corresponde a la primera fila.
-// l2 corresponde a la segunda fila.
+// Simplifica la escritura en la pantalla LCD. Limpia los datos
+// antiguos y escribe dos lineas nuevas de forma simultanea.
 // ============================================================
 
-void actualizarLCD(String l1, String l2) {
-
-  // Borra el contenido anterior de la pantalla.
+void actualizarLCD(String linea1, String linea2) {
   lcd.clear();
-
-  // Coloca el cursor al inicio de la primera fila.
+  
   lcd.setCursor(0, 0);
-  lcd.print(l1);
-
-  // Coloca el cursor al inicio de la segunda fila.
+  lcd.print(linea1);
+  
   lcd.setCursor(0, 1);
-  lcd.print(l2);
-}
-
-
-// ============================================================
-// FUNCION cargarEEPROM()
-// ============================================================
-// Recupera los contadores almacenados en las direcciones
-// definidas para cada variable.
-// ============================================================
-
-void cargarEEPROM() {
-
-  // Lee los paquetes grandes desde la direccion 0.
-  EEPROM.get(0, pGrandes);
-
-  // Lee los paquetes pequenos desde la direccion 2.
-  EEPROM.get(2, pPequenos);
-
-  // Lee los paquetes rechazados desde la direccion 4.
-  EEPROM.get(4, pRechazos);
-
-  // Lee el total historico desde la direccion 6.
-  EEPROM.get(6, totalHistorico);
-
-
-  // Validacion inicial limitada.
-  // Comprueba si el primer contador presenta determinados
-  // valores que se consideran invalidos en este programa.
-  //
-  // Una implementacion mas robusta debe validar todos los
-  // campos y comprobar que la EEPROM haya sido inicializada.
-  if (pGrandes == -1 || pGrandes > 30000) {
-
-    // Reinicia los contadores si se cumple la condicion.
-    pGrandes = 0;
-    pPequenos = 0;
-    pRechazos = 0;
-    totalHistorico = 0;
-
-    // Guarda los valores iniciales.
-    guardarEEPROM();
-  }
-}
-
-
-// ============================================================
-// FUNCION guardarEEPROM()
-// ============================================================
-// Escribe las estadisticas actuales en sus direcciones
-// correspondientes de la memoria no volatil.
-// ============================================================
-
-void guardarEEPROM() {
-
-  // Almacena los paquetes grandes en la direccion 0.
-  EEPROM.put(0, pGrandes);
-
-  // Almacena los paquetes pequenos en la direccion 2.
-  EEPROM.put(2, pPequenos);
-
-  // Almacena los paquetes rechazados en la direccion 4.
-  EEPROM.put(4, pRechazos);
-
-  // Almacena el total historico en la direccion 6.
-  EEPROM.put(6, totalHistorico);
-}
-
-
-// ============================================================
-// FUNCION mostrarReporte()
-// ============================================================
-// Construye dos cadenas de texto con las estadisticas actuales
-// y las presenta en la pantalla LCD.
-// ============================================================
-
-void mostrarReporte() {
-
-  // Primera fila: cantidades por categoria.
-  String r1 = "G:" + String(pGrandes) +
-              " P:" + String(pPequenos) +
-              " R:" + String(pRechazos);
-
-  // Segunda fila: acumulado historico.
-  String r2 = "Total:" + String(totalHistorico);
-
-  // Muestra el reporte en la pantalla.
-  actualizarLCD(r1, r2);
+  lcd.print(linea2);
 }
 ```
 

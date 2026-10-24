@@ -1,258 +1,394 @@
-// Permite utilizar la comunicacion I2C de la pantalla LCD.
-#include <Wire.h>
-
-// Permite controlar una pantalla LCD mediante un adaptador I2C.
-#include <LiquidCrystal_I2C.h>
-
-// Permite controlar los servomotores.
 #include <Servo.h>
-
-// Permite leer y escribir datos en la memoria EEPROM.
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 #include <EEPROM.h>
 
-const int pinLDR1 = A0; // Sensor inferior
-const int pinLDR2 = A1; // Sensor superior
-const int pinMotor = 7;
-const int pinBuzzer = 8;
-const int pinLedAzul = 4;
-const int pinLedVerde = 5;
-const int pinLedRojo = 6;
+// Pines del Arduino Mega 2560
+const int pinRelayMotor = 7;
+const int pinLDRBajo = A0;
+const int pinLDRAlto = A1;
+const int pinServo1 = 8;
+const int pinServo2 = 9;
+const int pinLedAzul = 2;
+const int pinLedVerde = 3;
+const int pinLedRojo = 4;
+const int pinBuzzer = 5;
 
-Servo servoGrandes;
-Servo servoPequenos;
+const int UMBRAL_LDR = 700;
+
+// Direcciones de almacenamiento EEPROM
+const int DIR_GRANDE = 0;
+const int DIR_PEQUENO = 2;
+const int DIR_RECHAZO = 4;
+const int DIR_TOTAL_HISTORICO = 8;
+
+// Perifericos
+Servo servo1;
+Servo servo2;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-int pGrandes = 0;
-int pPequenos = 0;
-int pRechazos = 0;
-long totalHistorico = 0;
-String modoActual = "NORMAL";
-bool bandaActiva = false;
-int loteObjetivo = 0;
-int loteActual = 0;
+// Temporizadores de los servos
+unsigned long tiempoActivacionS1 = 0;
+unsigned long tiempoActivacionS2 = 0;
+bool s1Activo = false;
+bool s2Activo = false;
 
-unsigned long tiempoServo = 0;
-bool servoActivo = false;
-unsigned long tiempoLed = 0;
+const unsigned long TIEMPO_RETORNO_S1 = 4500;
+const unsigned long TIEMPO_RETORNO_S2 = 7500;
+
+// Estados de deteccion
+enum EstadoDeteccion {
+  ESPERANDO,
+  CONFIRMANDO,
+  ESPERANDO_LIBERACION
+};
+
+EstadoDeteccion estadoSensor = ESPERANDO;
+unsigned long tiempoInicioDeteccion = 0;
+const unsigned long TIEMPO_CONFIRMACION = 150;
+
+bool l1Detectado = false;
+bool l2Detectado = false;
+unsigned long tiempoRechazo = 0;
+bool rechazoActivo = false;
+
+// Control de beeps
+bool beepRechazoActivo = false;
+int beepsRealizados = 0;
+unsigned long tiempoUltimoBeep = 0;
+
+// Bluetooth y modos
+String comandoBT = "";
+
+enum ModoOperacion {
+  DETENIDO,
+  NORMAL,
+  PAUSADO,
+  MANTENIMIENTO,
+  LOTE,
+  FIN_LOTE
+};
+
+ModoOperacion modoActual = DETENIDO;
+
+// Estadisticas
+int contGrande = 0;
+int contPequeno = 0;
+int contRechazo = 0;
+unsigned long totalHistorico = 0;
+int objetivoLote = 0;
+int procesadosLote = 0;
 
 void setup() {
-  // Inicializa la comunicacion serial para depuracion por USB.
   Serial.begin(9600);
-
-  // Inicializa la comunicacion con el modulo Bluetooth en el Arduino Mega (Pines 18 y 19).
   Serial1.begin(9600);
 
-  // Configura como salidas los dispositivos que reciben senales de control.
-  pinMode(pinMotor, OUTPUT);
-  pinMode(pinBuzzer, OUTPUT);
+  pinMode(pinRelayMotor, OUTPUT);
   pinMode(pinLedAzul, OUTPUT);
   pinMode(pinLedVerde, OUTPUT);
   pinMode(pinLedRojo, OUTPUT);
+  pinMode(pinBuzzer, OUTPUT);
 
-  // Asocia cada objeto Servo con su pin de control.
-  servoGrandes.attach(9);
-  servoPequenos.attach(10);
+  servo1.attach(pinServo1);
+  servo2.attach(pinServo2);
 
-  // Coloca ambos servos en su posicion neutral inicial.
-  resetServos();
+  servo1.write(90);
+  servo2.write(90);
 
-  // Inicializa la pantalla y activa su iluminacion.
   lcd.init();
   lcd.backlight();
 
-  // Recupera los contadores previamente guardados.
-  cargarEEPROM();
+  // Recuperar datos de EEPROM
+  EEPROM.get(DIR_GRANDE, contGrande);
+  EEPROM.get(DIR_PEQUENO, contPequeno);
+  EEPROM.get(DIR_RECHAZO, contRechazo);
+  EEPROM.get(DIR_TOTAL_HISTORICO, totalHistorico);
 
-  // Enciende el LED azul para indicar que el sistema inicio.
+  if (contGrande < 0 || contGrande > 32000)
+    contGrande = 0;
+
+  if (contPequeno < 0 || contPequeno > 32000)
+    contPequeno = 0;
+
+  if (contRechazo < 0 || contRechazo > 32000)
+    contRechazo = 0;
+
+  if (totalHistorico == 0xFFFFFFFFUL)
+    totalHistorico = 0;
+
+  actualizarLCD("SmartSort GT", "Esperando cmd...");
   digitalWrite(pinLedAzul, HIGH);
-
-  // Muestra un mensaje inicial en la pantalla.
-  actualizarLCD("SmartSort GT", "Esperando cmd..");
+  digitalWrite(pinRelayMotor, HIGH);
 }
 
 void loop() {
-  // Comprueba si se recibio una instruccion por Bluetooth.
-  procesarBluetooth();
-  
-  if (bandaActiva && modoActual != "MANTENIM") {
-    leerSensores();
-  }
-  
-  // Revisa si corresponde finalizar una actuacion o apagar LED.
-  gestionarTemporizadores();
-}
+  unsigned long tiempoActual = millis();
 
-void procesarBluetooth() {
-  if (Serial1.available() > 0) {
-    String cmd = Serial1.readStringUntil('\n');
-    cmd.trim();
+  // Recibir comandos Bluetooth
+  while (Serial1.available() > 0) {
+    char c = Serial1.read();
 
-    if (cmd == "iniciar") {
-      bandaActiva = true;
-      digitalWrite(pinMotor, HIGH);
-      modoActual = "NORMAL";
-      actualizarLCD("Modo: NORMAL", "Banda: ON");
-
-    } else if (cmd == "pausa") {
-      bandaActiva = false;
-      digitalWrite(pinMotor, LOW);
-      actualizarLCD("PAUSADO", "Banda: OFF");
-
-    } else if (cmd == "detener") {
-      bandaActiva = false;
-      digitalWrite(pinMotor, LOW);
-      mostrarReporte();
-
-    } else if (cmd == "reporte") {
-      mostrarReporte();
-
-    } else if (cmd == "Resetear") {
-      pGrandes = 0;
-      pPequenos = 0;
-      pRechazos = 0;
-      guardarEEPROM();
-      actualizarLCD("Reset OK", "Nuevo turno listo");
-
-    } else if (cmd.startsWith("modo_lote:")) {
-      loteObjetivo = cmd.substring(10).toInt();
-      loteActual = 0;
-      modoActual = "LOTE";
-      bandaActiva = true;
-      digitalWrite(pinMotor, HIGH);
-      actualizarLCD("Lote: " + String(loteObjetivo) + " paq", "Banda: ON");
-
-    } else if (cmd == "modo_normal") {
-      modoActual = "NORMAL";
-      actualizarLCD("Modo: NORMAL", "Esperando...");
-
-    } else if (cmd == "modo_mantenimiento") {
-      modoActual = "MANTENIM";
-      bandaActiva = true;
-      digitalWrite(pinMotor, HIGH);
-      actualizarLCD("Modo: MANTENIM.", "Banda: ON");
-
-    } else if (cmd == "estado") {
-      actualizarLCD("Modo: " + modoActual, bandaActiva ? "Banda: ON" : "Banda: OFF");
-
+    if (c == '\n' || c == '\r') {
+      if (comandoBT.length() > 0) {
+        ejecutarComando(comandoBT);
+        comandoBT = "";
+      }
     } else {
-      actualizarLCD("ERROR:", "Cmd invalido");
+      comandoBT += c;
     }
   }
-}
 
-void leerSensores() {
-  if (servoActivo) return;
+  // Leer sensores en modo normal o por lote
+  if (modoActual == NORMAL || modoActual == LOTE) {
+    int valorL1 = analogRead(pinLDRBajo);
+    int valorL2 = analogRead(pinLDRAlto);
 
-  int luz1 = analogRead(pinLDR1);
-  int luz2 = analogRead(pinLDR2);
-  int umbral = 800;
-  
-  bool l1_corte = (luz1 < umbral);
-  bool l2_corte = (luz2 < umbral);
+    bool actualL1 = (valorL1 < UMBRAL_LDR);
+    bool actualL2 = (valorL2 < UMBRAL_LDR);
 
-  if (l1_corte || l2_corte) {
-    if (l1_corte && !l2_corte) {
-      clasificarPaquete(1); // Pequeno
-    } else if (l1_corte && l2_corte) {
-      clasificarPaquete(2); // Grande
-    } else {
-      clasificarPaquete(3); // Rechazo
+    if (estadoSensor == ESPERANDO) {
+      if (actualL1 || actualL2) {
+        estadoSensor = CONFIRMANDO;
+        tiempoInicioDeteccion = tiempoActual;
+        l1Detectado = actualL1;
+        l2Detectado = actualL2;
+      }
+    }
+    else if (estadoSensor == CONFIRMANDO) {
+      if (actualL1) l1Detectado = true;
+      if (actualL2) l2Detectado = true;
+
+      if (tiempoActual - tiempoInicioDeteccion >= TIEMPO_CONFIRMACION) {
+        int tipo = 0;
+
+        if (l1Detectado && l2Detectado) tipo = 1;
+        else if (l1Detectado && !l2Detectado) tipo = 2;
+        else if (!l1Detectado && l2Detectado) tipo = 3;
+
+        // Clasificar paquete grande
+        if (tipo == 1 && !s1Activo) {
+          servo1.write(45);
+          digitalWrite(pinLedVerde, HIGH);
+          tone(pinBuzzer, 1000, 200);
+          actualizarLCD("Paq: GRANDE", "Desviando S1");
+
+          s1Activo = true;
+          tiempoActivacionS1 = tiempoActual;
+
+          if (contGrande < 32000) contGrande++;
+          if (totalHistorico < 4000000000UL) totalHistorico++;
+
+          EEPROM.put(DIR_GRANDE, contGrande);
+          EEPROM.put(DIR_TOTAL_HISTORICO, totalHistorico);
+          procesadosLote++;
+        }
+
+        // Clasificar paquete pequeno
+        else if (tipo == 2 && !s2Activo) {
+          servo2.write(140);
+          digitalWrite(pinLedVerde, HIGH);
+          tone(pinBuzzer, 1500, 200);
+          actualizarLCD("Paq: PEQUENO", "Desviando S2");
+
+          s2Activo = true;
+          tiempoActivacionS2 = tiempoActual;
+
+          if (contPequeno < 32000) contPequeno++;
+          if (totalHistorico < 4000000000UL) totalHistorico++;
+
+          EEPROM.put(DIR_PEQUENO, contPequeno);
+          EEPROM.put(DIR_TOTAL_HISTORICO, totalHistorico);
+          procesadosLote++;
+        }
+
+        // Registrar paquete rechazado
+        else if (tipo == 3) {
+          digitalWrite(pinLedRojo, HIGH);
+          actualizarLCD("Paq: RECHAZO", "Sin desvio");
+
+          rechazoActivo = true;
+          tiempoRechazo = tiempoActual;
+
+          if (contRechazo < 32000) contRechazo++;
+          if (totalHistorico < 4000000000UL) totalHistorico++;
+
+          EEPROM.put(DIR_RECHAZO, contRechazo);
+          EEPROM.put(DIR_TOTAL_HISTORICO, totalHistorico);
+          procesadosLote++;
+
+          beepRechazoActivo = true;
+          beepsRealizados = 1;
+          tiempoUltimoBeep = tiempoActual;
+          tone(pinBuzzer, 500, 100);
+        }
+
+        // Comprobar si se completo el lote
+        if (modoActual == LOTE &&
+            procesadosLote >= objetivoLote) {
+          modoActual = FIN_LOTE;
+          actualizarLCD("Meta alcanzada", "Terminando...");
+        }
+
+        estadoSensor = ESPERANDO_LIBERACION;
+      }
+    }
+    else if (estadoSensor == ESPERANDO_LIBERACION) {
+      if (!actualL1 && !actualL2) {
+        estadoSensor = ESPERANDO;
+      }
     }
   }
-}
 
-void clasificarPaquete(int tipo) {
-  servoActivo = true;
-  tiempoServo = millis();
-  tiempoLed = millis();
-
-  if (tipo == 1) {
-    pPequenos++;
-    servoPequenos.write(45);
-    digitalWrite(pinLedVerde, HIGH);
-    tone(pinBuzzer, 1500, 200);
-    actualizarLCD("Paq: PEQUENO", "Desviando S2");
-
-  } else if (tipo == 2) {
-    pGrandes++;
-    servoGrandes.write(45);
-    digitalWrite(pinLedVerde, HIGH);
-    tone(pinBuzzer, 1000, 200);
-    actualizarLCD("Paq: GRANDE", "Desviando S1");
-
-  } else {
-    pRechazos++;
-    digitalWrite(pinLedRojo, HIGH);
-    tone(pinBuzzer, 500, 100);
-    actualizarLCD("Paq: RECHAZO", "Pasa libre");
-  }
-
-  totalHistorico++;
-  guardarEEPROM();
-
-  if (modoActual == "LOTE") {
-    loteActual++;
-    if (loteActual >= loteObjetivo) {
-      bandaActiva = false;
-      digitalWrite(pinMotor, LOW);
-      actualizarLCD("Lote completo", "Procesados: " + String(loteActual));
-      tone(pinBuzzer, 800, 1000);
-      modoActual = "NORMAL";
+  // Generar tres beeps para rechazo
+  if (beepRechazoActivo) {
+    if (tiempoActual - tiempoUltimoBeep >= 200) {
+      if (beepsRealizados < 3) {
+        tone(pinBuzzer, 500, 100);
+        tiempoUltimoBeep = tiempoActual;
+        beepsRealizados++;
+      } else {
+        beepRechazoActivo = false;
+      }
     }
   }
-}
 
-void gestionarTemporizadores() {
-  if (servoActivo && (millis() - tiempoServo >= 2000)) {
-    resetServos();
-    servoActivo = false;
+  // Detener la banda al terminar el lote
+  if (modoActual == FIN_LOTE) {
+    if (!s1Activo && !s2Activo && !rechazoActivo) {
+      modoActual = DETENIDO;
+      digitalWrite(pinRelayMotor, HIGH);
+      actualizarLCD("Lote completo", "Banda: OFF");
+      tone(pinBuzzer, 2000, 1500);
+    }
   }
 
-  if (millis() - tiempoLed > 500) {
+  // Retornar servo de paquetes grandes
+  if (s1Activo &&
+      tiempoActual - tiempoActivacionS1 >= TIEMPO_RETORNO_S1) {
+    servo1.write(90);
     digitalWrite(pinLedVerde, LOW);
+    s1Activo = false;
+    refrescarPantallaBase();
+  }
+
+  // Retornar servo de paquetes pequenos
+  if (s2Activo &&
+      tiempoActual - tiempoActivacionS2 >= TIEMPO_RETORNO_S2) {
+    servo2.write(90);
+    digitalWrite(pinLedVerde, LOW);
+    s2Activo = false;
+    refrescarPantallaBase();
+  }
+
+  // Apagar indicador de rechazo
+  if (rechazoActivo &&
+      tiempoActual - tiempoRechazo >= 1500) {
     digitalWrite(pinLedRojo, LOW);
+    rechazoActivo = false;
+    refrescarPantallaBase();
   }
 }
 
-void resetServos() {
-  servoGrandes.write(90);
-  servoPequenos.write(90);
+void ejecutarComando(String cmd) {
+  cmd.trim();
+
+  if (cmd.equalsIgnoreCase("iniciar") ||
+      cmd.equalsIgnoreCase("modo_normal")) {
+    modoActual = NORMAL;
+    digitalWrite(pinRelayMotor, LOW);
+    actualizarLCD("Modo: NORMAL", "Banda: ON");
+  }
+  else if (cmd.equalsIgnoreCase("pausa")) {
+    modoActual = PAUSADO;
+    digitalWrite(pinRelayMotor, HIGH);
+    actualizarLCD("PAUSADO", "Banda: OFF");
+  }
+  else if (cmd.equalsIgnoreCase("detener")) {
+    modoActual = DETENIDO;
+    digitalWrite(pinRelayMotor, HIGH);
+
+    String rep = "G:" + String(contGrande) +
+                 " P:" + String(contPequeno) +
+                 " R:" + String(contRechazo) +
+                 " T:" + String(contGrande +
+                                 contPequeno +
+                                 contRechazo);
+
+    actualizarLCD("REPORTE FINAL", rep);
+  }
+  else if (cmd.equalsIgnoreCase("modo_mantenimiento")) {
+    modoActual = MANTENIMIENTO;
+    digitalWrite(pinRelayMotor, LOW);
+    actualizarLCD("Modo: MANTENIM.", "Sensores OFF");
+  }
+  else if (cmd.equalsIgnoreCase("estado")) {
+    refrescarPantallaBase();
+  }
+  else if (cmd.equalsIgnoreCase("reporte")) {
+    String linea1 = "G:" + String(contGrande) +
+                    " P:" + String(contPequeno);
+
+    String linea2 = "R:" + String(contRechazo) +
+                    " T:" + String(contGrande +
+                                    contPequeno +
+                                    contRechazo) +
+                    " H:" + String(totalHistorico);
+
+    actualizarLCD(linea1, linea2);
+  }
+  else if (cmd.startsWith("modo_lote:")) {
+    String strNum = cmd.substring(10);
+    objetivoLote = strNum.toInt();
+
+    if (objetivoLote > 0) {
+      modoActual = LOTE;
+      procesadosLote = 0;
+      digitalWrite(pinRelayMotor, LOW);
+
+      actualizarLCD(
+        "Lote: " + String(objetivoLote) + " paq",
+        "Banda: ON"
+      );
+    } else {
+      actualizarLCD("ERROR:", "Param. invalido");
+    }
+  }
+  else if (cmd.equalsIgnoreCase("resetear")) {
+    contGrande = 0;
+    contPequeno = 0;
+    contRechazo = 0;
+
+    EEPROM.put(DIR_GRANDE, contGrande);
+    EEPROM.put(DIR_PEQUENO, contPequeno);
+    EEPROM.put(DIR_RECHAZO, contRechazo);
+
+    actualizarLCD("Reset OK", "Nuevo turno listo");
+  }
+  else {
+    actualizarLCD("ERROR:", "Cmd invalido");
+  }
 }
 
-void actualizarLCD(String l1, String l2) {
+void refrescarPantallaBase() {
+  if (modoActual == NORMAL)
+    actualizarLCD("Modo: NORMAL", "Banda: ON");
+  else if (modoActual == PAUSADO)
+    actualizarLCD("PAUSADO", "Banda: OFF");
+  else if (modoActual == DETENIDO)
+    actualizarLCD("SmartSort GT", "Esperando cmd...");
+  else if (modoActual == MANTENIMIENTO)
+    actualizarLCD("Modo: MANTENIM.", "Sensores OFF");
+  else if (modoActual == LOTE)
+    actualizarLCD(
+      "Lote: " + String(objetivoLote) + " paq",
+      "Procesando..."
+    );
+}
+
+void actualizarLCD(String linea1, String linea2) {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(l1);
+  lcd.print(linea1);
   lcd.setCursor(0, 1);
-  lcd.print(l2);
-}
-
-void cargarEEPROM() {
-  EEPROM.get(0, pGrandes);
-  EEPROM.get(2, pPequenos);
-  EEPROM.get(4, pRechazos);
-  EEPROM.get(6, totalHistorico);
-
-  if (pGrandes == -1 || pGrandes > 30000) {
-    pGrandes = 0;
-    pPequenos = 0;
-    pRechazos = 0;
-    totalHistorico = 0;
-    guardarEEPROM();
-  }
-}
-
-void guardarEEPROM() {
-  EEPROM.put(0, pGrandes);
-  EEPROM.put(2, pPequenos);
-  EEPROM.put(4, pRechazos);
-  EEPROM.put(6, totalHistorico);
-}
-
-void mostrarReporte() {
-  String r1 = "G:" + String(pGrandes) +
-              " P:" + String(pPequenos) +
-              " R:" + String(pRechazos);
-  String r2 = "Total:" + String(totalHistorico);
-  actualizarLCD(r1, r2);
+  lcd.print(linea2);
 }
