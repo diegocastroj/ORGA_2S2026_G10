@@ -1,6 +1,6 @@
 # Organización Computacional
 
-## Práctica 3 - SmartSort GT
+## Proyecto - SmartSort GT
 
 **Universidad de San Carlos de Guatemala**  
 **Facultad de Ingeniería - Ingeniería en Ciencias y Sistemas**  
